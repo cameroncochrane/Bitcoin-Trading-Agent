@@ -5,10 +5,12 @@
     # - Open/update/close positions in trading.db (each one automatically records the trade, its realised pnl, and the cash change)
     # - Send a Telegram notification when a trade is executed
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
 
+import pandas as pd
 import sqlalchemy
 from agents import Agent, FunctionTool, MaxTurnsExceeded, Runner, function_tool, set_default_openai_key
 
@@ -27,11 +29,11 @@ from src.notification import chat_id, send_telegram_message
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = "gpt-6-luna"
-INDICATOR_DAYS = 14 # How many of the most recent daily rows (with indicators) are shown to the agent
+PRICE_HISTORY_DAYS = 90 # How many of the most recent daily candles (OHLCV + indicators) are shown to the agent for its own technical analysis
 STARTING_CASH_BALANCE = float(os.getenv("STARTING_CASH_BALANCE", "10000")) # $10,000. Only used the very first time the cash table is seeded
 PRICE_TOLERANCE = 0.005 # Trades are refused if the price the agent passes differs from the live price by more than this fraction (0.5%)
 MAX_TRADE_FRACTION = 0.10 # A single buy can cost at most this fraction (10%) of total portfolio value (cash + open BTC at the trade price)
-TRADE_HISTORY_LIMIT = 50 # get_trade_history shows the agent only this many of the most recent trades, so the prompt doesn't grow every hour
+TRADE_HISTORY_LIMIT = 100 # get_trade_history shows the agent only this many of the most recent trades, so the prompt doesn't grow every hour
 MAX_TURNS = 15 # Most model calls one hourly run may make; a normal cycle needs about 4-6 (see run_agent)
 
 logger = logging.getLogger(__name__)
@@ -79,7 +81,7 @@ def get_portfolio() -> list[dict]:
 
 @function_tool(failure_error_function=_log_tool_error)
 def get_trade_history() -> dict:
-    """Return the most recent trades (at most 50, oldest first), plus totals from the full history.
+    """Return the most recent trades (at most 100, oldest first), plus totals from the full history.
 
     Only the last TRADE_HISTORY_LIMIT trades are returned so the prompt doesn't grow every hour. Because older position ids
     drop out of that window, it also returns next_position_id (the next unused P_n) and the all-time trade count and realised pnl.
@@ -310,7 +312,7 @@ def send_trade_notification(message: str) -> str:
     return "Notification sent."
 
 
-AGENT_INSTRUCTIONS = """
+AGENT_INSTRUCTIONS = f"""
 You are an autonomous BTC portfolio-management agent. You are invoked roughly once an hour and
 have no memory of previous runs other than what is stored in the database, so always start by
 calling get_portfolio, get_trade_history, and get_cash to see what positions you are already
@@ -325,21 +327,33 @@ Finish by returning a brief summary of your decision and reasoning.
 
 Some additional caveats:
 - When opening a position use the next_position_id returned by get_trade_history (the first ever position is P_1). Ids are
-never reused, even after a position is closed. get_trade_history only lists the last 50 trades, so rely on next_position_id
+never reused, even after a position is closed. get_trade_history only lists the last {TRADE_HISTORY_LIMIT} trades, so rely on next_position_id
 rather than working the next id out yourself. A position can have several trades (T_n) against it, e.g. its opening buy,
 later buys or partial sells, and its closing sell.
 
 - Dollar cost averaging is allowed: to add to or reduce an open position, call update_position with the BTC bought (positive)
 or sold (negative). It recalculates the position's average entry price. To sell a whole position, use close_position.
 
-- Buys are refused if there isn't enough cash, or if a single buy would cost more than 10% of total portfolio value (cash plus
+- Buys are refused if there isn't enough cash, or if a single buy would cost more than {MAX_TRADE_FRACTION:.0%} of total portfolio value (cash plus
 open positions at the current price). Size every buy within both limits; check get_cash and get_portfolio first. Sells and
 closes are never limited.
 
 - Don't hallucinate the current price. Pass the latest BTC price provided explicitly to you as the price for every trade;
-trades at a price more than 0.5% away from it are refused.
+trades at a price more than {PRICE_TOLERANCE:.1%} away from it are refused.
 
-- Historical data covers roughly the last 3 months of daily prices. Technical indicators (SMA, EMA, RSI, MACD, ATR) have already been calculated on it and the most recent days are given to you in the prompt. Use these values rather than calculating your own.
+- You're given up to {PRICE_HISTORY_DAYS} days of daily BTC-USD candles (open, high, low, close, volume) with pre-calculated
+indicators (SMA, EMA, RSI, MACD, ATR). Use them for your own technical analysis, e.g. trend, support and resistance,
+momentum, and volatility. Prefer the pre-calculated indicator values over recalculating them yourself, since mental
+arithmetic over many rows is error-prone. The last candle is today's and is still forming.
+
+- Model predictions are given as JSON, one entry per model, each with a "status". Only use a model whose status is "ok";
+ignore one that is "unavailable" or "error". Each entry includes the model's test metrics and known limitations: weigh it
+accordingly, and never trade on a model prediction alone.
+
+- The direction model ("direction") is a weak signal. On its test set it scored a ROC AUC of 0.61 (0.5 is a coin flip)
+and 54.5% accuracy against a 50.8% base rate, and it predicted "down" about 85% of the time, catching only about 20% of
+actual rises. It was trained on raw prices from years when BTC was far cheaper, so at today's prices its output barely
+changes (around 0.25) whatever the market does. Give it little or no weight, especially when its entry has a "warning".
 
 - Portfolio value can be calculated by considering position values and the cash present (returned by get_cash).
 
@@ -387,23 +401,24 @@ def _format_context(context: dict | None) -> str:
             f"pct_change={pct_change:.2f}%"
         )
 
-        # Indicator columns are added to the history in main.py; show whichever are present for the most recent days
-        indicator_columns = [
-            column for column in historical_price.columns
-            if column.startswith(("SMA_", "EMA_", "RSI_", "MACD", "ATR_", "IDR"))
-        ]
-        if indicator_columns:
-            date_column = ["Date"] if "Date" in historical_price.columns else []
-            recent = historical_price[date_column + ["Close"] + indicator_columns].tail(INDICATOR_DAYS)
-            recent = recent.round({column: 2 for column in ["Close"] + indicator_columns})
-            sections.append(
-                f"Daily close and technical indicators (last {INDICATOR_DAYS} days, oldest first):\n"
-                f"{recent.to_string(index=False)}"
-            )
+        # Full daily candles (OHLCV) so the agent can run its own technical analysis, plus the indicators added in main.py.
+        # CSV keeps it compact; indicators are blank during their warm-up period (e.g. the first 19 days of SMA_20)
+        indicator_columns = [column for column in historical_price.columns if column.startswith(("SMA_", "EMA_", "RSI_", "MACD", "ATR_", "IDR"))]
+        price_columns = [column for column in ("Date", "Open", "High", "Low", "Close", "Volume") if column in historical_price.columns]
+        recent = historical_price[price_columns + indicator_columns].tail(PRICE_HISTORY_DAYS).copy()
+        if "Date" in recent.columns:
+            recent["Date"] = pd.to_datetime(recent["Date"]).dt.strftime("%Y-%m-%d")
+        if "Volume" in recent.columns:
+            recent["Volume"] = recent["Volume"].round().astype("Int64")
+        sections.append(
+            f"Daily BTC-USD candles and technical indicators (last {len(recent)} days, oldest first, CSV). "
+            "The last row is today's candle, still forming, so its close is roughly the live price:\n"
+            f"{recent.to_csv(index=False, float_format='%.2f').strip()}"
+        )
 
     predictions = context.get("predictions")
     if predictions:
-        sections.append(f"Model predictions:\n{predictions}")
+        sections.append(f"Model predictions (JSON):\n{json.dumps(predictions, indent=2, default=str)}")
 
     news = context.get("news")
     if news:
