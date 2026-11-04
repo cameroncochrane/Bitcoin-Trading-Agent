@@ -24,6 +24,21 @@
           "kms:ViaService": "ssm.*.amazonaws.com"
         }
       }
+    },
+    {
+      "Sid": "ReadWriteDatabaseBackups",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::btc-agent-934912969749-eu-west-2-an/btc-agent/*"
+    },
+    {
+      "Sid": "CheckWhetherABackupExists",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::btc-agent-934912969749-eu-west-2-an"
     }
   ]
 }

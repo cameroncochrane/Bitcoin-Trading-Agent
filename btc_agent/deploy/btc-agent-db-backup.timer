@@ -1,0 +1,12 @@
+[Unit]
+Description=Back up btc-agent's trading.db to S3 every hour
+
+[Timer]
+# 15 minutes past each hour: after the agent's hourly run (which starts on the hour) has had time to finish trading
+OnCalendar=*-*-* *:15:00
+# If the instance was off at the scheduled time, back up as soon as it's running again
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

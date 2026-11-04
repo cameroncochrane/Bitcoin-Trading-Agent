@@ -1,0 +1,27 @@
+[Unit]
+Description=Restore btc-agent's trading.db from S3 if it's missing, and back it up on shutdown
+After=network-online.target btc-agent-secrets.service
+Requires=btc-agent-secrets.service
+Wants=network-online.target
+# The agent and frontend require this unit, so they never start before the database is in place. On shutdown they stop
+# first (systemd stops units in reverse order), so the final backup below is taken once nothing is writing to the database
+Before=btc-agent.service btc-agent-app.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=btc-agent
+Group=btc-agent
+EnvironmentFile=/etc/btc-agent/env
+# On boot: keep the local database if it survived (reboot or stop/start); otherwise download the latest backup
+# (replacement instance). Fails, so the app doesn't start, if a backup might exist but couldn't be checked or downloaded
+ExecStart=/opt/btc-agent/btc_agent/deploy/db_backup.sh restore
+# On shutdown (including stop or terminate from the EC2 console, which shut the instance down cleanly): one last backup
+ExecStop=/opt/btc-agent/btc_agent/deploy/db_backup.sh backup
+TimeoutStopSec=120
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

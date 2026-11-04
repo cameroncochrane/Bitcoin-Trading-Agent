@@ -1,0 +1,16 @@
+[Unit]
+Description=Back up btc-agent's trading.db to S3
+After=network-online.target btc-agent-db-restore.service
+Wants=network-online.target
+# Never back up before the boot-time restore has finished, or an empty database could overwrite the real backup
+Requires=btc-agent-db-restore.service
+
+[Service]
+Type=oneshot
+User=btc-agent
+Group=btc-agent
+EnvironmentFile=/etc/btc-agent/env
+ExecStart=/opt/btc-agent/btc_agent/deploy/db_backup.sh backup
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full

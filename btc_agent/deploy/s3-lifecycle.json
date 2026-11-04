@@ -1,0 +1,14 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-old-btc-agent-db-backups",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "btc-agent/history/"
+      },
+      "Expiration": {
+        "Days": 30
+      }
+    }
+  ]
+}

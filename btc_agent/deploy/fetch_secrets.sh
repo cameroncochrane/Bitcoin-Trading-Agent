@@ -80,6 +80,10 @@ if [ ! -s "$TMP_FILE" ]; then
     exit 1
 fi
 
+# Pass the region on too (unless a parameter already set it), so the AWS CLI calls in db_backup.sh, run by the other
+# units with this file as their environment, don't depend on the CLI finding the region by itself
+grep -q '^AWS_REGION=' "$TMP_FILE" || printf 'AWS_REGION=%s\n' "$REGION" >> "$TMP_FILE"
+
 mv "$TMP_FILE" "$ENV_FILE"
 chown "root:${ENV_GROUP}" "$ENV_FILE"
 chmod 640 "$ENV_FILE"

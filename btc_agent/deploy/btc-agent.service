@@ -1,7 +1,8 @@
 [Unit]
 Description=BTC trading agent (hourly scheduler)
-After=network-online.target btc-agent-secrets.service
-Requires=btc-agent-secrets.service
+After=network-online.target btc-agent-secrets.service btc-agent-db-restore.service
+# The database must be restored from S3 (if missing) before the app touches it, or it would start a brand-new portfolio
+Requires=btc-agent-secrets.service btc-agent-db-restore.service
 Wants=network-online.target
 
 [Service]
