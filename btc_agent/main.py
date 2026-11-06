@@ -11,8 +11,9 @@ from src.paths import DIRECTION_MODEL_DIR, VOLATILITY_MODEL_DIR
 # Custom modules:
 from src.price_data import fetch_live_BTCUSD, fetch_historical_BTCUSD
 from src.price_indicators import add_SMA, add_EMA, add_ranges, add_RSI, add_MACD
+from src.volatility_features import add_volatility_features
 from src.news import fetch_news_articles
-from src.predictions import predict_direction, predict_volatility, RollingWindowTransformer # RollingWindowTransformer must be imported here (at module level) for the direction pipeline to load
+from src.predictions import predict_direction, predict_volatility, RollingWindowTransformer # RollingWindowTransformer must be imported here (at module level) for the direction and volatility pipelines to load
 from src.agent import run_agent
 from src.database.database import create_database, modify_row, fetch_table_data, portfolio_table, trades_table
 from src.notification import send_email
@@ -25,11 +26,13 @@ def main():
 
     def return_price():
         current_price = fetch_live_BTCUSD() # Fetch latest price
-        three_month_data = fetch_historical_BTCUSD(period="3mo") # Historical data (for context)
-        
-        return current_price, three_month_data
+        # Six months of daily history: the volatility model needs about 109 completed days (60-day warm-up for rv_60d plus its
+        # 48-day lookback). The agent is shown only the last 90 days of candles (PRICE_HISTORY_DAYS in src/agent.py)
+        price_history = fetch_historical_BTCUSD(period="6mo")
 
-    current_price, three_month_data = return_price()
+        return current_price, price_history
+
+    current_price, price_history = return_price()
 
     def add_price_indicators(historical_data):
         """
@@ -46,7 +49,7 @@ def main():
 
         return data
 
-    three_month_data = add_price_indicators(three_month_data)
+    price_history = add_price_indicators(price_history)
 
     def update_portfolio(current_price: pd.DataFrame) -> list[dict[str, object]]:
         """
@@ -84,13 +87,15 @@ def main():
         DIRECTION_PREPROCESSOR_NAME = "process_pipeline.joblib"
         DIRECTION_MODEL_NAME = "model_simple.keras" 
 
-        VOLATILITY_MODEL_NAME = ""
-        VOLATILITY_PREPROCESSOR_NAME = ""
+        VOLATILITY_MODEL_NAME = "vol_model_simple.keras"
+        VOLATILITY_PREPROCESSOR_NAME = "vol_pipeline.joblib"
+        VOLATILITY_EVALUATION_NAME = "vol_model_evaluation.json" # Test metrics saved by the volatility notebook
 
         d_model_path = DIRECTION_MODEL_DIR / DIRECTION_MODEL_NAME
         d_preprocessor_path = DIRECTION_MODEL_DIR / DIRECTION_PREPROCESSOR_NAME
         v_model_path = VOLATILITY_MODEL_DIR / VOLATILITY_MODEL_NAME
         v_preprocessor_path = VOLATILITY_MODEL_DIR / VOLATILITY_PREPROCESSOR_NAME
+        v_evaluation_path = VOLATILITY_MODEL_DIR / VOLATILITY_EVALUATION_NAME
 
         # Today's daily candle is still forming (its close is effectively the live price), but both models were trained on
         # completed days only, so it's dropped here rather than appending the current price
@@ -99,8 +104,9 @@ def main():
 
         direction_data = completed[["Close"]] # Direction pipeline only needs the "Close" column
 
-        volatility_data = completed[["Open","High","Low","Close","Volume"]].copy()
-        # Add line here to create the volatility features required to input the model e.g log returns etc
+        # Volatility pipeline needs OHLCV plus the volatility features it was trained on. calculate_y=False: no future label at
+        # inference, so dropna only removes the warm-up rows and the latest completed day is kept
+        volatility_data = add_volatility_features(completed[["Open", "High", "Low", "Close", "Volume"]], calculate_y=False)
 
         # Each model returns its prediction, model name/type, and test metrics so the agent can assess reliability.
         # A failing model is logged and reported as an error, so it never stops the agent from running.
@@ -112,18 +118,18 @@ def main():
             predictions["direction"] = {"status": "error", "reason": f"{type(error).__name__}: {error}"}
 
         if not (VOLATILITY_MODEL_NAME and VOLATILITY_PREPROCESSOR_NAME):
-            predictions["volatility"] = {"status": "unavailable", "reason": "The volatility model hasn't been trained yet."}
+            predictions["volatility"] = {"status": "unavailable", "reason": "No volatility model is configured."}
         else:
             try:
-                predictions["volatility"] = predict_volatility(volatility_data, v_model_path, v_preprocessor_path, as_of_date)
+                predictions["volatility"] = predict_volatility(volatility_data, v_model_path, v_preprocessor_path, as_of_date, v_evaluation_path)
             except Exception as error:
                 logger.exception("Volatility model prediction failed.")
                 predictions["volatility"] = {"status": "error", "reason": f"{type(error).__name__}: {error}"}
 
-        logger.info("Model predictions: %s", {name: result.get("probability_up", result.get("status")) for name, result in predictions.items()})
+        logger.info("Model predictions: %s", {name: result.get("probability_up", result.get("predicted_volatility_20d", result.get("status"))) for name, result in predictions.items()})
         return predictions
 
-    predictions = models_predict(three_month_data,current_price)
+    predictions = models_predict(price_history, current_price)
 
     def ask_agent_portfolio(current_price, historical_price, current_portfolio, predictions, news):
         """
@@ -139,7 +145,7 @@ def main():
         }
         return run_agent(api_token=None, context=context) # Imported from src.agent
 
-    ask_agent_portfolio(current_price, three_month_data, current_portfolio, predictions, news) # run_agent logs the agent's summary
+    ask_agent_portfolio(current_price, price_history, current_portfolio, predictions, news) # run_agent logs the agent's summary
 
     
 if __name__ == "__main__":

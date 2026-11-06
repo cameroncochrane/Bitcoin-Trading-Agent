@@ -355,6 +355,12 @@ and 54.5% accuracy against a 50.8% base rate, and it predicted "down" about 85% 
 actual rises. It was trained on raw prices from years when BTC was far cheaper, so at today's prices its output barely
 changes (around 0.25) whatever the market does. Give it little or no weight, especially when its entry has a "warning".
 
+- The volatility model ("volatility") forecasts how much BTC is likely to move over the next 20 days (realised volatility of
+daily log returns, e.g. 0.06 means a typical 20-day move of about 6%), not which way. On its test set it was worse than the
+persistence baseline (assuming the last 20 days' realised volatility carries on), so use "persistence_baseline_20d" as
+your main volatility estimate and the model's "predicted_volatility_20d" only as a weak second opinion. Use volatility to
+size and pace trades, e.g. smaller buys when expected volatility is high, never as a buy or sell signal by itself.
+
 - Portfolio value can be calculated by considering position values and the cash present (returned by get_cash).
 
 - After trades have been executed, send a Telegram message via the send_trade_notification tool you have.

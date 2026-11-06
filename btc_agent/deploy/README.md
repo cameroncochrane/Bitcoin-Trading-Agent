@@ -65,8 +65,10 @@ Every backup is stored twice: `btc-agent/trading.db` (always the latest, used by
 
 ```
 /opt/btc-agent/                  # the git clone (repo root), owned by root
-├── .venv/                       # Python virtual environment, owned by root
+├── .venv/                       # Python virtual environment, owned by root (about 2 GB)
 └── btc_agent/                   # the app: working directory for the agent and frontend
+    ├── models/direction/        # direction model + pipeline (in git)
+    ├── models/volatility/       # volatility model + pipeline + test metrics (in git)
     ├── databases/trading.db     # writable by btc-agent; restored from S3 or created on the first run
     ├── logs/btc_agent.log       # writable by btc-agent; created on the first run
     └── deploy/                  # this folder
@@ -77,15 +79,33 @@ Every backup is stored twice: `btc-agent/trading.db` (always the latest, used by
 The code is owned by root and the `btc-agent` user can only write `databases/` and `logs/`, so the running agent can't
 modify its own code, and `git pull` always runs as root.
 
+## Before you deploy (on your laptop)
+
+The instance gets the code **and the trained models** from GitHub, so everything has to be committed and pushed first:
+
+```bash
+git status                     # btc_agent/models/volatility/ and any code changes must not be listed as untracked/modified
+git add -A && git commit -m "..." && git push
+```
+
+Optional, but the cheapest way to catch a bad key or model name: do one local run first (see the main
+[README](../../README.md#running-locally)). `MODEL` in `src/agent.py` is the OpenAI model the agent uses; a wrong name only
+shows up as an error on the first real run.
+
 ## Before you start
 
-- **Instance:** in `eu-west-2`, with at least 2 GB of RAM (e.g. `t3.small`). TensorFlow and Streamlit together don't fit
-  in 1 GB.
-- **Python 3.10 or newer** (3.12 matches development). Amazon Linux 2023's default `python3` is 3.9, which is too old:
-  install `python3.12` with `sudo dnf install -y python3.12`. Ubuntu 24.04's default `python3` is already 3.12.
-- **Git and the AWS CLI** on the instance. Amazon Linux 2023 includes the AWS CLI; on Ubuntu install it first
+- **Instance:** in `eu-west-2`, **x86_64** (e.g. `t3.small`: the dependencies were checked for x86_64 only), with at least
+  2 GB of RAM (TensorFlow and Streamlit together don't fit in 1 GB) and **at least 16 GB of disk** (the virtual environment
+  alone is about 2 GB, and the default 8 GB root volume fills up during `pip install`).
+- **Operating system: Amazon Linux 2023 or Ubuntu 22.04/24.04.** TensorFlow 2.21 needs glibc 2.27 or newer, so
+  **Amazon Linux 2 won't work** (pip fails with "No matching distribution found for tensorflow").
+- **Python 3.12** (matches development). Amazon Linux 2023's default `python3` is 3.9, which is too old: install it with
+  `sudo dnf install -y python3.12 python3.12-pip git`. Ubuntu 24.04's default `python3` is already 3.12
+  (`sudo apt install -y python3-venv git`).
+- **The AWS CLI** on the instance. Amazon Linux 2023 includes it; on Ubuntu install it first
   (see the [AWS CLI install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)).
-- **Repo access:** if the GitHub repo is private, the instance needs a deploy key or token to clone and pull it.
+- **Repo access:** the GitHub repo is public, so the instance can clone it over HTTPS without a key. (Public also means
+  anyone can read the code and models; the keys and the database are never in git.)
 - **The AWS CLI on your own Windows or Mac machine**, signed in with your own AWS credentials, for steps 1 and 2 and for
   checking backups.
 
@@ -121,9 +141,9 @@ Run these from your own machine. They need your real AWS credentials and real ke
 4. **Create the service user, clone the repo, and install the dependencies:**
    ```bash
    sudo useradd --system --create-home --home-dir /var/lib/btc-agent --shell /usr/sbin/nologin btc-agent
-   sudo git clone <your-repo-url> /opt/btc-agent
+   sudo git clone https://github.com/cameroncochrane/vlXsnPPgKKnWqEJB.git /opt/btc-agent
    sudo python3.12 -m venv /opt/btc-agent/.venv   # or python3 on Ubuntu 24.04
-   sudo /opt/btc-agent/.venv/bin/pip install -r /opt/btc-agent/btc_agent/requirements.txt
+   sudo /opt/btc-agent/.venv/bin/pip install --no-cache-dir -r /opt/btc-agent/btc_agent/requirements.txt   # takes a few minutes
    # The only places the services write to:
    sudo install -d -o btc-agent -g btc-agent /opt/btc-agent/btc_agent/databases /opt/btc-agent/btc_agent/logs
    ```
@@ -149,12 +169,25 @@ Run these from your own machine. They need your real AWS credentials and real ke
    ```
    You should see your keys plus `BACKUP_S3_URI` and `AWS_REGION` (added automatically).
 
-8. **Do one run by hand** before trusting the hourly timer. This loads the keys and runs `main.py` once as the service user:
+   **Optional: set the timezone.** The weekly email goes out on Monday at 09:00 *instance time*, and EC2 instances use UTC
+   by default (09:00 UTC is 09:00 in winter and 10:00 in summer in the UK). For UK time:
+   ```bash
+   sudo timedatectl set-timezone Europe/London && sudo systemctl restart btc-agent
+   ```
+   The database always stores times in UTC, whatever the instance's timezone.
+
+8. **Do one run by hand** before trusting the hourly timer. This loads the keys and runs `main.py` once as the service user
+   (it takes a minute or so: loading TensorFlow and both models is the slow part):
    ```bash
    sudo -u btc-agent -H bash -c 'set -a; . /etc/btc-agent/env; set +a; cd /opt/btc-agent/btc_agent && ../.venv/bin/python main.py'
    ```
-   Then check `/opt/btc-agent/btc_agent/logs/btc_agent.log` for errors, and open `http://<instance-public-ip>:8501` to see
-   the frontend.
+   Then check the log for errors. A healthy run logs a line like
+   `Model predictions: {'direction': 0.2457, 'volatility': 0.1441}` (a number for each model; `'error'` instead of a number
+   means that model failed, and the traceback is just above it) followed by the agent's summary:
+   ```bash
+   tail -n 50 /opt/btc-agent/btc_agent/logs/btc_agent.log
+   ```
+   Open `http://<instance-public-ip>:8501` to see the frontend. If the agent traded, a Telegram message should have arrived.
 
 9. **Check backups work.** Take one now on the instance, then list the bucket from your own machine:
    ```bash
@@ -183,13 +216,30 @@ Commands marked **(laptop)** run on your own machine with the AWS CLI; the rest 
 | Stop trading | `sudo systemctl stop btc-agent` |
 
 ### Deploying code changes
-`git fetch` alone doesn't change any files; `git pull` does:
+Commit and push from your laptop first. Then, on the instance (`git fetch` alone doesn't change any files; `git pull` does):
 ```bash
 sudo git -C /opt/btc-agent pull
-sudo /opt/btc-agent/.venv/bin/pip install -r /opt/btc-agent/btc_agent/requirements.txt
+sudo /opt/btc-agent/.venv/bin/pip install --no-cache-dir -r /opt/btc-agent/btc_agent/requirements.txt
 sudo systemctl restart btc-agent btc-agent-app
 ```
-If the pull changed anything in `deploy/`, repeat steps 5 and 6 (they include `daemon-reload`) before restarting.
+- **Do it between about :20 and :55 past the hour.** The agent runs on the hour, and restarting `btc-agent` stops a run in
+  progress. Each trade is saved all-or-nothing, so nothing is half-written, but that hour's run is lost.
+- `main.py` starts as a fresh process every hour, so changes to `main.py`, `src/` or the models are picked up by the next
+  run even without a restart. `timer.py` and `app.py` only change after the restart above.
+- If the pull changed anything in `deploy/`, repeat steps 5 and 6 (they include `daemon-reload`) before restarting.
+
+### Updating a model after retraining
+1. Save the new files from the notebook with **the same filenames** into `btc_agent/models/direction/`
+   (`model_simple.keras`, `process_pipeline.joblib`) or `btc_agent/models/volatility/` (`vol_model_simple.keras`,
+   `vol_pipeline.joblib`, `vol_model_evaluation.json`). A different filename means changing the names in `models_predict()`
+   in `main.py` too.
+2. The volatility model's test metrics are read from `vol_model_evaluation.json` on every run, so they update by
+   themselves. The direction model's metrics (`DIRECTION_MODEL_INFO` in `src/predictions.py`) and both models' descriptions
+   and limitations (also there, and in the agent instructions in `src/agent.py`) are written by hand: update them if the
+   model's behaviour changes, e.g. if the volatility model starts beating its persistence baseline.
+3. A model that needs more history or new feature columns may need changes in `main.py` (the price fetch is 6 months, and
+   the volatility model needs about 109 completed days).
+4. Run `python main.py` locally once, then commit, push and deploy as above.
 
 ### Changing a key
 Update it in Parameter Store from your laptop, then re-fetch the keys on the instance:
@@ -223,4 +273,9 @@ The next hourly backup then makes that copy the latest one in S3.
 | "Database check failed" | The backup in S3 is damaged. Restore an earlier copy from `history/` (see above). |
 | "BACKUP_S3_URI isn't set" | Add the `/btc-agent/BACKUP_S3_URI` parameter (step 1), then run `sudo systemctl restart btc-agent-secrets` and restart the other units. |
 | "Permission denied" writing `trading.db` or `btc_agent.log` | Re-run the `install -d` line from step 4. |
+| `pip install` fails: "No matching distribution found for tensorflow" | The OS is too old (e.g. Amazon Linux 2) or the instance isn't x86_64. Use Amazon Linux 2023 or Ubuntu 22.04+ on x86_64. |
+| `pip install` fails: "No space left on device" | The root volume is too small. Increase it to 16 GB or more (EC2 console: Volumes -> Modify), extend the filesystem, and re-run step 4's `pip install`. |
+| The run is killed, or `dmesg` shows "Out of memory" | 1 GB of RAM isn't enough for TensorFlow plus Streamlit. Use an instance with 2 GB or more. |
+| The log shows `'volatility': 'error'` or `'direction': 'error'` | That model failed; the traceback just above says why (e.g. a missing model file: check it was committed and pulled). The agent still runs and ignores that model. |
+| The weekly email arrives at the wrong hour | The instance's timezone (see step 7). |
 | The agent or frontend won't start for another reason | `sudo journalctl -u btc-agent -n 50` shows the error. A missing key (e.g. `TELEGRAM_BOT_TOKEN is not set`) means it isn't in Parameter Store under `/btc-agent/`. |

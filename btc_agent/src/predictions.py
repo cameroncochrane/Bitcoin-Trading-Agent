@@ -92,18 +92,84 @@ def predict_direction(direction_data: pd.DataFrame, model_path: Union[str, Path]
     return result
 
 
-def predict_volatility(volatility_data: pd.DataFrame, model_path: Union[str, Path], preprocessor_path: Union[str, Path], as_of_date: str) -> dict:
-    """Run the volatility model and return its result as a dict the agent can read. Not implemented until the model is trained.
+# Model details shown to the agent alongside each volatility prediction. Test metrics are read from the evaluation JSON saved
+# next to the model by the volatility modelling notebook (see load_volatility_metrics), so they stay correct after retraining.
+VOLATILITY_HORIZON_DAYS = 20 # The target is realised volatility over the next 20 daily candles (BTC trades every day)
+DAYS_PER_YEAR = 365 # For annualising: BTC trades every day of the year
+VOLATILITY_MODEL_INFO = {
+    "model": "LSTM (vol_model_simple)",
+    "target": f"Realised volatility of BTC's daily log returns over the next {VOLATILITY_HORIZON_DAYS} days, i.e. sqrt(sum of squared daily log returns), not annualised",
+    "known_limitations": "On its test set it was less accurate than simply assuming the last 20 days' realised volatility carries on (the persistence baseline below): higher error, and its predictions were not positively correlated with what happened. Prefer the persistence baseline, and treat the model's figure as a weak second opinion at best.",
+}
 
-    Return the same shape as predict_direction so the agent sees both models consistently: "status": "ok", the model's
-    name, target, test metrics and known limitations, "as_of_date", "inputs", and the prediction itself
-    (e.g. "predicted_volatility" with its units and horizon).
+
+def load_volatility_metrics(evaluation_path: Union[str, Path]) -> dict:
+    """Read the volatility model's test metrics (and the persistence baseline's) from the notebook's evaluation JSON.
+
+    Returns an empty dict if the file is missing or unreadable, so a missing evaluation file never stops a prediction.
 
     Example:
-        >>> predict_volatility(volatility_data, VOLATILITY_MODEL_DIR / "model.keras", VOLATILITY_MODEL_DIR / "pipeline.joblib", "2026-11-02")
-        {'status': 'ok', 'predicted_volatility': ..., ...}
+        >>> load_volatility_metrics(VOLATILITY_MODEL_DIR / "vol_model_evaluation.json")
+        {'model': {'MAE': 0.052, ...}, 'persistence_baseline': {'MAE': 0.0346, ...}}
     """
-    raise NotImplementedError("Volatility inference hasn't been written yet")
+    try:
+        evaluation = pd.read_json(evaluation_path, orient="index")
+    except (OSError, ValueError):
+        return {}
+    rounded = evaluation.round(4)
+    names = {"LSTM": "model", "Persistence": "persistence_baseline"}
+    return {names.get(name, name): rounded.loc[name].to_dict() for name in rounded.index}
+
+
+def predict_volatility(volatility_data: pd.DataFrame, model_path: Union[str, Path], preprocessor_path: Union[str, Path], as_of_date: str, evaluation_path: Union[str, Path, None] = None) -> dict:
+    """Run the volatility model on completed daily candles and return the result as a dict the agent can read.
+
+    ``volatility_data`` is completed daily OHLCV with the features from add_volatility_features(..., calculate_y=False),
+    oldest first. The last ``lookback`` rows (48 for vol_model_simple) of the columns the scaler was fitted on go through
+    the saved pipeline (scaler + rolling window) and the LSTM. The latest rv_20d is reported as the persistence baseline,
+    since it beat the model on the test set. Volatilities are given per 20 days and annualised.
+
+    Example:
+        >>> features = add_volatility_features(completed[["Open", "High", "Low", "Close", "Volume"]], calculate_y=False)
+        >>> predict_volatility(features, VOLATILITY_MODEL_DIR / "vol_model_simple.keras", VOLATILITY_MODEL_DIR / "vol_pipeline.joblib", "2026-11-02")
+        {'status': 'ok', 'predicted_volatility_20d': 0.0712, 'persistence_baseline_20d': 0.0654, ...}
+    """
+    pipeline = load_preprocessor(preprocessor_path)
+    model = load_keras_model(model_path)
+    lookback = pipeline.named_steps["rolling"].lookback
+    scaler = pipeline.named_steps["scaler"]
+    feature_columns = list(scaler.feature_names_in_) # Same columns, in the same order, as in training
+
+    missing = [column for column in feature_columns if column not in volatility_data.columns]
+    if missing:
+        raise ValueError(f"The volatility data is missing the feature columns {missing}")
+    if len(volatility_data) < lookback:
+        raise ValueError(f"The volatility model needs {lookback} days of features but only {len(volatility_data)} were supplied (the 60-day realised volatility needs about 60 extra days of history first)")
+    features = volatility_data[feature_columns].tail(lookback)
+
+    predicted = float(model.predict(pipeline.transform(features), verbose=0)[0][0])
+    persistence = float(features["rv_20d"].iloc[-1])
+    annualise = (DAYS_PER_YEAR / VOLATILITY_HORIZON_DAYS) ** 0.5
+    close_index = feature_columns.index("Close")
+    distance = float(scaler.transform(features.tail(1))[0][close_index]) # Scaled close: (close - training median) / training IQR
+
+    result = {
+        "status": "ok",
+        **VOLATILITY_MODEL_INFO,
+        "test_metrics": load_volatility_metrics(evaluation_path) if evaluation_path else {},
+        "as_of_date": as_of_date,
+        "inputs": f"Last {lookback} completed daily candles: OHLCV plus return and realised/range volatility features",
+        "predicted_volatility_20d": round(predicted, 4),
+        "predicted_volatility_annualised": round(predicted * annualise, 4),
+        "persistence_baseline_20d": round(persistence, 4),
+        "persistence_baseline_annualised": round(persistence * annualise, 4),
+        "persistence_baseline_explained": "Realised volatility over the last 20 completed days, assumed to carry on. It beat the model on the test set.",
+        "how_to_read": f"0.06 over 20 days means a typical 20-day move of about 6% (one standard deviation of the {VOLATILITY_HORIZON_DAYS}-day log return); annualised multiplies by sqrt({DAYS_PER_YEAR}/{VOLATILITY_HORIZON_DAYS}).",
+        "latest_close_vs_training_data": f"{distance:.1f} interquartile ranges from the training median close of ${scaler.center_[close_index]:,.0f}",
+    }
+    if abs(distance) > 3:
+        result["warning"] = "The latest close (and volume) is far outside the range this model was trained on, so its prediction is especially unreliable; rely on the persistence baseline."
+    return result
 
 
 # Custom transformers used in pipeline(s):
