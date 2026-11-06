@@ -16,5 +16,5 @@ RAW_DATA_PATH = RAW_DATA_DIR / "btcusd_data.pkl" # Raw BTC_USD data
 
 MODEL_DIR = PROJ_ROOT / "models"
 DCN_MODEL_DIR = MODEL_DIR / "direction"
-VOL_MODEL_DIR = MODEL_DIR / "volatility"
+VOL_MODEL_DIR = MODEL_DIR / "volatility" / "lstm"
 
