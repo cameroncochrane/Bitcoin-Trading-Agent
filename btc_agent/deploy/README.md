@@ -109,6 +109,15 @@ shows up as an error on the first real run.
 - **The AWS CLI on your own Windows or Mac machine**, signed in with your own AWS credentials, for steps 1 and 2 and for
   checking backups.
 
+## Access via SSH
+
+Assunming that your machine has AWS CLI and has the EC2 specific access key-value set-up:
+
+`ssh -i "{USER_ENV}\.ssh\btc_agent_master.pem" ubuntu@{IPV4_IP}`
+
+`{USER_ENV}` could be something like `"C:\Users\cochr"`
+`{IPV4_IP}` is the instance's public IPv4 address e.g. 13.40.147.170. It changes when the instance is terminated.
+
 ## One-time setup in AWS
 
 Run these from your own machine. They need your real AWS credentials and real key values, so do them yourself.
@@ -165,9 +174,24 @@ Run these from your own machine. They need your real AWS credentials and real ke
 6. **Install and start the systemd units:**
    ```bash
    sudo cp /opt/btc-agent/btc_agent/deploy/*.service /opt/btc-agent/btc_agent/deploy/*.timer /etc/systemd/system/
-   sudo systemctl daemon-reload
+   sudo systemctl daemon-reload # Acts as a 'refresh'
    sudo systemctl enable --now btc-agent-secrets.service btc-agent-db-restore.service btc-agent.service btc-agent-app.service btc-agent-db-backup.timer
    ```
+  N.B: To restart a service during troubleshooting use:
+  ```bash
+  # Reload systemd configuration (if you modified the btc-agent-secrets.service file as an example)
+  sudo systemctl daemon-reload
+
+  # Clear previous failure states
+  sudo systemctl reset-failed btc-agent-secrets.service
+
+  # Restart the service
+  sudo systemctl restart btc-agent-secrets.service
+
+  # Check service status
+  sudo systemctl status btc-agent-secrets.service
+  ```
+
    `db_backup.sh` is run straight from the repo, so it must be executable. `ls -l /opt/btc-agent/btc_agent/deploy/db_backup.sh`
    should show `-rwxr-xr-x` (git keeps this). If it doesn't, run `sudo chmod +x` on it.
 
@@ -220,6 +244,22 @@ Run these from your own machine. They need your real AWS credentials and real ke
    ```
    You should see `btc-agent/trading.db` and one `btc-agent/history/trading-<timestamp>.db`.
 
+10. **Check .service scripts' status**
+
+  ```bash
+  sudo systemctl status \
+  btc-agent-secrets.service \
+  btc-agent-db-restore.service \
+  btc-agent.service \
+  btc-agent-app.service \
+  btc-agent-db-backup.timer \
+  --no-pager
+  ```
+  
+  Check for failed services:
+  ```bash
+  sudo systemctl --failed
+  ```
 ## Day-to-day
 
 Commands marked **(laptop)** run on your own machine with the AWS CLI; the rest run on the instance.
