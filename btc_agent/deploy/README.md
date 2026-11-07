@@ -94,7 +94,7 @@ shows up as an error on the first real run.
 
 ## Before you start
 
-- **Instance:** in `eu-west-2`, **x86_64** (e.g. `t3.small`: the dependencies were checked for x86_64 only), with at least
+- **Instance:** in `eu-west-2`, **x86_64** (this deployment uses a `t3.medium`, 4 GB; the dependencies were checked for x86_64 only), with at least
   2 GB of RAM (TensorFlow and Streamlit together don't fit in 1 GB) and **at least 16 GB of disk** (the virtual environment
   alone is about 2 GB, and the default 8 GB root volume fills up during `pip install`).
 - **Operating system: Amazon Linux 2023 or Ubuntu 22.04/24.04.** TensorFlow 2.21 needs glibc 2.27 or newer, so
@@ -147,6 +147,14 @@ Run these from your own machine. They need your real AWS credentials and real ke
    # The only places the services write to:
    sudo install -d -o btc-agent -g btc-agent /opt/btc-agent/btc_agent/databases /opt/btc-agent/btc_agent/logs
    ```
+   **Check Yahoo Finance answers from this instance** before going further. Yahoo sometimes rate-limits or blocks cloud
+   provider addresses, and every hourly run (and the frontend's chart) depends on it. This should print a price and a
+   number of days, not an error:
+   ```bash
+   cd /opt/btc-agent/btc_agent && sudo -u btc-agent -H ../.venv/bin/python -c "from src.price_data import fetch_live_BTCUSD, fetch_historical_BTCUSD; print(fetch_live_BTCUSD()['Close'].iloc[0], len(fetch_historical_BTCUSD('6mo')))"
+   ```
+   If it fails with "Too Many Requests" or "returned no BTC-USD historical data", wait an hour and try again. If it keeps
+   failing, the app can't run on this instance as it is: see Troubleshooting.
 
 5. **Install the secrets script** to a fixed location outside the repo, so the secrets unit doesn't depend on where the
    repo is cloned, and only changes when you deliberately reinstall it:
@@ -176,7 +184,8 @@ Run these from your own machine. They need your real AWS credentials and real ke
    ```
    The database always stores times in UTC, whatever the instance's timezone.
 
-8. **Do one run by hand** before trusting the hourly timer. This loads the keys and runs `main.py` once as the service user
+8. **Do one run by hand** before trusting the hourly timer. The timer is already running (step 6), so **do this between
+   about :05 and :55 past the hour**; otherwise two runs could overlap and both trade. This loads the keys and runs `main.py` once as the service user
    (it takes a minute or so: loading TensorFlow and both models is the slow part):
    ```bash
    sudo -u btc-agent -H bash -c 'set -a; . /etc/btc-agent/env; set +a; cd /opt/btc-agent/btc_agent && ../.venv/bin/python main.py'
@@ -188,6 +197,19 @@ Run these from your own machine. They need your real AWS credentials and real ke
    tail -n 50 /opt/btc-agent/btc_agent/logs/btc_agent.log
    ```
    Open `http://<instance-public-ip>:8501` to see the frontend. If the agent traded, a Telegram message should have arrived.
+
+   Things to know about the services the app uses:
+   - **Telegram** only delivers to a chat that has messaged the bot first (send it `/start` once from your account). Besides
+     trade messages, it sends an alert whenever a Yahoo Finance request still fails after its retries, and whenever an
+     hourly run is still going when the next hour starts (the scheduler stops it first, so runs never pile up).
+   - **Yahoo Finance** is only asked for prices by the hourly run and when someone uses the frontend: the frontend doesn't
+     refresh the price by itself, so press **Refresh price** for a new one (a page load reuses a price under 5 minutes old).
+   - **Mailtrap's demo sender** (`hello@demomailtrap.co`) can only send to the email address your Mailtrap account was set
+     up with, so the weekly email must go to that address.
+   - **NewsAPI's free plan** allows 100 requests a day (the agent uses 24, the frontend up to 48) and its articles are
+     about 24 hours old.
+   - **Logs:** the agent, the scheduler and the frontend all write to `btc_agent.log`. When it rotates at 1 MB, a few lines
+     can land in `btc_agent.log.1` instead. `journalctl` always has every line.
 
 9. **Check backups work.** Take one now on the instance, then list the bucket from your own machine:
    ```bash
@@ -278,4 +300,6 @@ The next hourly backup then makes that copy the latest one in S3.
 | The run is killed, or `dmesg` shows "Out of memory" | 1 GB of RAM isn't enough for TensorFlow plus Streamlit. Use an instance with 2 GB or more. |
 | The log shows `'volatility': 'error'` or `'direction': 'error'` | That model failed; the traceback just above says why (e.g. a missing model file: check it was committed and pulled). The agent still runs and ignores that model. |
 | The weekly email arrives at the wrong hour | The instance's timezone (see step 7). |
+| Telegram alert "Yahoo Finance request failed after N attempts", or the frontend says it couldn't get the price or history | Yahoo Finance is rate-limiting or blocking the instance's address. Each fetch is already retried (after 5, 15 and 45 seconds in the hourly run; once after 3 seconds in the frontend) before the alert is sent, and that hour's run is skipped without trading. Occasional alerts need nothing doing: the next hourly run tries again. If they keep coming, stopping and starting the instance gives it a new public IP (unless it has an Elastic IP); otherwise the price data needs another source. |
+| Telegram alert "the hourly run started at ... was still running an hour later, so it was stopped" | A run hung (e.g. a request that never returned), so the scheduler stopped it before starting the next one; only one run ever exists at a time. Nothing needs doing if it's a one-off. `sudo journalctl -u btc-agent --since "<that hour>"` shows the last thing the run logged, i.e. where it got stuck. |
 | The agent or frontend won't start for another reason | `sudo journalctl -u btc-agent -n 50` shows the error. A missing key (e.g. `TELEGRAM_BOT_TOKEN is not set`) means it isn't in Parameter Store under `/btc-agent/`. |

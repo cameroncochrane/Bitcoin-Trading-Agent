@@ -19,6 +19,8 @@ setup_logging() # Safe on every Streamlit rerun: handlers are only added once
 logger = logging.getLogger(__name__)
 
 PERIODS = ["3mo", "6mo", "1y", "2y", "5y", "max"] # Yahoo Finance lookback periods offered for the chart
+APP_RETRY_DELAYS = (3,) # One quick retry: the page is blocked while it waits, so don't use price_data's minute-long default here
+LIVE_PRICE_TTL_SECONDS = 300 # A price fetched less than 5 minutes ago is reused by page loads; the Refresh price button always fetches a new one
 OVERLAYS = {"SMA_7": "#f59e0b", "SMA_20": "#ef4444", "EMA_7": "#3b82f6", "EMA_20": "#8b5cf6"} # Moving averages drawn on the price pane, and their colours
 UP, DOWN = "#26a69a", "#ef5350" # Candle / histogram colours for rising and falling values
 
@@ -34,7 +36,7 @@ def load_history(period: str) -> pd.DataFrame:
         >>> history[["Date", "Close", "RSI_14"]].tail()
     """
     try:
-        data = fetch_historical_BTCUSD(period=period)
+        data = fetch_historical_BTCUSD(period=period, retry_delays=APP_RETRY_DELAYS)
     except Exception:
         logger.exception("Couldn't load BTC-USD history for the chart (period %s).", period)
         raise
@@ -43,15 +45,19 @@ def load_history(period: str) -> pd.DataFrame:
     return add_MACD(data=add_RSI(data=data))
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_live_price() -> float:
-    """Return the latest BTC-USD price, cached for 60 seconds so page refreshes don't hammer Yahoo Finance.
+@st.cache_data(ttl=LIVE_PRICE_TTL_SECONDS, show_spinner="Fetching the BTC-USD price...")
+def load_live_price() -> tuple[float, pd.Timestamp]:
+    """Return the latest BTC-USD price and when it was fetched (UTC).
+
+    There's no automatic refresh, so Yahoo Finance is only asked when someone uses the app: a page load reuses a price fetched
+    in the last LIVE_PRICE_TTL_SECONDS, and the Refresh price button clears this cache to force a new fetch. Fewer requests
+    make Yahoo less likely to rate-limit the server.
 
     Example:
-        >>> price = load_live_price()
+        >>> price, fetched_at = load_live_price()
     """
     try:
-        return float(fetch_live_BTCUSD()["Close"].iloc[0])
+        return float(fetch_live_BTCUSD(retry_delays=APP_RETRY_DELAYS)["Close"].iloc[0]), pd.Timestamp.now(tz="UTC")
     except Exception:
         logger.exception("Couldn't load the live BTC-USD price.")
         raise
@@ -139,16 +145,24 @@ def build_charts(data: pd.DataFrame, overlays: list[str], dark: bool) -> list[di
     return [{"chart": pane(420, False), "series": price_series}, {"chart": pane(140, False), "series": macd_series}, {"chart": pane(140, True), "series": rsi_series}]
 
 
-@st.fragment(run_every="60s")
 def portfolio_summary() -> None:
-    """Show the live portfolio value (cash + open BTC at the latest price) and its parts. Re-runs on its own every 60 seconds.
+    """Show the live portfolio value (cash + open BTC at the latest price) and its parts, with a button to refresh the price.
 
-    Positions are valued at the live price here, rather than the hourly mark stored in trading.db by main.py.
+    Positions are valued at the live price here, rather than the hourly mark stored in trading.db by main.py. Nothing
+    refreshes on its own: the price is fetched when the page loads (see load_live_price) or the button is pressed.
 
     Example:
         >>> portfolio_summary()  # inside the Streamlit script
     """
-    price = load_live_price()
+    button_col, time_col = st.columns([1, 5], vertical_alignment="center")
+    if button_col.button("Refresh price", icon=":material/refresh:"):
+        load_live_price.clear() # The click reruns the script, so the next line fetches a new price
+    try:
+        price, fetched_at = load_live_price()
+    except Exception: # Already logged (and alerted on Telegram) by load_live_price / price_data; failures aren't cached, so the button retries
+        time_col.error("Couldn't get the BTC price from Yahoo Finance (it may be rate-limiting this server). Try Refresh price in a minute.")
+        return
+    time_col.caption(f"Price fetched at {fetched_at:%d %b %Y, %H:%M:%S} UTC")
     positions, trades, cash = load_portfolio()
     btc_held = float(positions["btc_amnt"].sum()) if not positions.empty else 0.0
     unrealised = float(((price - positions["open_price"]) * positions["btc_amnt"]).sum()) if not positions.empty else 0.0
@@ -198,10 +212,14 @@ def main():
         period_col, overlay_col = st.columns([1, 3])
         period = period_col.selectbox("Period", PERIODS, index=PERIODS.index("1y"))
         overlays = overlay_col.multiselect("Moving averages", list(OVERLAYS), default=["SMA_20", "EMA_20"])
-        history = load_history(period)
         st.subheader("BTC-USD daily")
-        st.caption("Candles with volume and moving averages, then MACD (12/26/9), then RSI (14) with 70/30 guides.")
-        renderLightweightCharts(build_charts(history, overlays, dark=st.context.theme.type == "dark"), key=f"btc_{period}_{'_'.join(overlays)}")
+        try:
+            history = load_history(period)
+        except Exception: # Already logged and alerted; failures aren't cached, so reloading the page tries again
+            st.error("Couldn't load the BTC-USD history from Yahoo Finance (it may be rate-limiting this server). Reload the page in a minute.")
+        else:
+            st.caption("Candles with volume and moving averages, then MACD (12/26/9), then RSI (14) with 70/30 guides.")
+            renderLightweightCharts(build_charts(history, overlays, dark=st.context.theme.type == "dark"), key=f"btc_{period}_{'_'.join(overlays)}")
 
         positions_tab, trades_tab = st.tabs(["Open positions", "Trade history"])
         positions, trades, _ = load_portfolio()
@@ -210,7 +228,10 @@ def main():
                 st.info("No open positions.")
             else:
                 # Stored values are the hourly mark saved by main.py; the live columns revalue each position at the latest price
-                price = load_live_price()
+                try:
+                    price, _ = load_live_price()
+                except Exception: # No live price: show only the hourly marks stored by main.py
+                    price = float("nan")
                 positions["live_value"] = positions["btc_amnt"] * price
                 positions["live_pnl"] = (price - positions["open_price"]) * positions["btc_amnt"]
                 st.dataframe(positions, hide_index=True, column_order=["position_id", "btc_amnt", "open_price", "live_value", "live_pnl", "current_price", "current_value", "pnl", "date_time"], column_config={"live_value": st.column_config.NumberColumn("Live value", format="$%.2f"), "live_pnl": st.column_config.NumberColumn("Live unrealised P&L", format="$%.2f"), "position_id": "Position", "btc_amnt": st.column_config.NumberColumn("BTC", format="%.8f"), "open_price": st.column_config.NumberColumn("Avg entry", format="$%.2f"), "current_price": st.column_config.NumberColumn("Marked price", format="$%.2f"), "current_value": st.column_config.NumberColumn("Marked value", format="$%.2f"), "pnl": st.column_config.NumberColumn("Marked P&L", format="$%.2f"), "date_time": st.column_config.DatetimeColumn("Marked at (UTC)", format="D MMM YYYY, HH:mm")})

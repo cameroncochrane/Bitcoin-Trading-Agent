@@ -35,6 +35,7 @@ PRICE_TOLERANCE = 0.005 # Trades are refused if the price the agent passes diffe
 MAX_TRADE_FRACTION = 0.10 # A single buy can cost at most this fraction (10%) of total portfolio value (cash + open BTC at the trade price)
 TRADE_HISTORY_LIMIT = 100 # get_trade_history shows the agent only this many of the most recent trades, so the prompt doesn't grow every hour
 MAX_TURNS = 15 # Most model calls one hourly run may make; a normal cycle needs about 4-6 (see run_agent)
+STOP_LOSS_ATR_MULTIPLE = 2.0 # The agent is told to close a position once the price falls this many ATR_4s below its average entry price
 
 logger = logging.getLogger(__name__)
 _live_price: float | None = None # The latest BTC price supplied by main.py for this cycle; set by run_agent and checked by the trade tools
@@ -345,6 +346,11 @@ trades at a price more than {PRICE_TOLERANCE:.1%} away from it are refused.
 indicators (SMA, EMA, RSI, MACD, ATR). Use them for your own technical analysis, e.g. trend, support and resistance,
 momentum, and volatility. Prefer the pre-calculated indicator values over recalculating them yourself, since mental
 arithmetic over many rows is error-prone. The last candle is today's and is still forming.
+
+- Stop-loss: use the latest ATR_4 (4-day average true range, in dollars, from the most recent row of the candles) to decide
+when to cut a losing position. If the live price has fallen more than {STOP_LOSS_ATR_MULTIPLE:g} x ATR_4 below a position's
+average entry price (open_price), close it with close_position, even if other signals look positive. For example, with an
+entry of 100,000 and ATR_4 of 2,500, close once the price is below {100000 - STOP_LOSS_ATR_MULTIPLE * 2500:,.0f}.
 
 - Model predictions are given as JSON, one entry per model, each with a "status". Only use a model whose status is "ok";
 ignore one that is "unavailable" or "error". Each entry includes the model's test metrics and known limitations: weigh it
