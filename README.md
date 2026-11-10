@@ -62,7 +62,7 @@ machine learning models and recent news, then manages a simulated portfolio on i
   - The agent gets both the model's forecast and the baseline, and is told to rely on the baseline and use volatility
     for sizing, not as a buy or sell signal
 - **Training:** both models were trained on daily BTC-USD history from Yahoo Finance. Experiments (including a logistic
-  regression baseline for direction) are in `experimentation/`, training code in `modelling/`, and saved models and
+  regression baseline for direction) are in `experimentation/`, and saved models and
   evaluation plots in `models/`.
 
 ## APIs and services
@@ -101,7 +101,6 @@ machine learning models and recent news, then manages a simulated portfolio on i
   - `deploy/`: AWS EC2 deployment (systemd units, secrets and backup scripts, IAM policy); see
     [btc_agent/deploy/README.md](btc_agent/deploy/README.md)
 - `experimentation/`: notebooks from developing the direction and volatility models
-- `modelling/`: model training and evaluation code
 - `models/`: saved models and evaluation results from training
 - `data/`: training data (not committed)
 

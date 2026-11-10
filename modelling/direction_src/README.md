@@ -1,1 +1,0 @@
-This directory contains the final data-preprocessing pipeline and model training scripts for the price direction model used by the btc_agent application.
