@@ -1,5 +1,4 @@
-# vlXsnPPgKKnWqEJB
-Bitcoin Trading Agent
+# Bitcoin Trading Agent
 
 An autonomous Bitcoin **paper-trading** agent. Every hour, an LLM agent reviews BTC-USD market data, predictions from two
 machine learning models and recent news, then manages a simulated portfolio on its own. No real money is traded.
